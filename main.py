@@ -1,28 +1,22 @@
 import discord
 from discord.ext import commands
 from flask import Flask, request, jsonify, render_template_string
-import threading
-import os
-import datetime
-import json
-from interface import HTML_PAGE # استيراد الواجهة من الملف الثاني
+import threading, os, json, asyncio
+from interface import HTML_PAGE
 
-# --- إدارة البيانات ---
-DATA_FILE = "database.json"
-
-def load_data():
+# --- قاعدة البيانات ---
+DATA_FILE = "settings.json"
+def load_db():
     if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"words": {}}
+        with open(DATA_FILE, "r", encoding="utf-8") as f: return json.load(f)
+    return []
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
+def save_db(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False)
 
-db = load_data()
+db = load_db()
 
-# --- إعدادات البوت ---
+# --- البوت ---
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -31,74 +25,79 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_message(message):
     if message.author.bot: return
+    
     content = message.content.lower()
-    for word, config in db["words"].items():
-        if word in content:
-            await process_violation(message, config)
-            break
+    for rule in db:
+        for word in rule['words']:
+            if word.lower() in content:
+                await handle_violation(message, rule)
+                return
     await bot.process_commands(message)
 
-async def process_violation(message, config):
+async def handle_violation(message, rule):
     user = message.author
-    actions = config.get("actions", [])
     
-    if "delete" in actions:
+    # 1. الحذف
+    if rule['delete']['active']:
+        wait = int(rule['delete']['timer'])
+        await asyncio.sleep(wait)
         try: await message.delete()
         except: pass
 
-    if "reply" in actions:
-        rt = config.get("reply_text", "محتوى مخالف")
-        if config.get("reply_type") == "private":
-            try: await user.send(rt)
+    # 2. الرد
+    if rule['reply']['active']:
+        wait_r = int(rule['reply']['timer'])
+        await asyncio.sleep(wait_r)
+        msg = rule['reply']['msg']
+        if rule['reply']['loc'] == 'dm':
+            try: await user.send(msg)
             except: pass
         else:
-            await message.channel.send(f"⚠️ {user.mention}: {rt}", delete_after=15)
+            await message.channel.send(f"{user.mention} {msg}")
 
-    if "timeout" in actions:
+    # 3. الأوامر (Ban, Mute, Kick)
+    if rule['command']['active']:
+        cmd = rule['command']
+        reason = cmd['reason']
         try:
-            dur = datetime.timedelta(minutes=int(config.get("duration", 10)))
-            await user.timeout(dur, reason="رقابة آليّة")
-        except: pass
-
-    if "kick" in actions:
-        try: await user.kick(reason="رقابة آليّة")
-        except: pass
-
-    if "ban" in actions:
-        try: await user.ban(delete_message_days=1, reason="رقابة آليّة")
-        except: pass
+            if cmd['type'] == 'ban':
+                await user.ban(reason=reason)
+            elif cmd['type'] == 'kick':
+                await user.kick(reason=reason)
+            elif cmd['type'] == 'mute':
+                import datetime
+                dur = datetime.timedelta(minutes=int(cmd['dur']))
+                await user.timeout(dur, reason=reason)
+        except Exception as e: print(f"Command Error: {e}")
 
 # --- سيرفر الويب ---
 app = Flask(__name__)
 
 @app.route('/')
-def home(): return render_template_string(HTML_PAGE)
+def index(): return render_template_string(HTML_PAGE)
 
-@app.route('/api/list')
-def api_list(): return jsonify(db)
+@app.route('/api/rules')
+def get_rules(): return jsonify(db)
 
-@app.route('/api/add', methods=['POST'])
-def api_add():
-    req = request.json
-    db["words"][req['word'].lower()] = {
-        "actions": req['actions'],
-        "reply_text": req.get('reply_text'),
-        "reply_type": req.get('reply_type'),
-        "duration": req.get('duration')
-    }
-    save_data(db)
-    return jsonify({"ok": True})
+@app.route('/api/save', methods=['POST'])
+def save_rule():
+    global db
+    new_rule = request.json
+    db = [r for r in db if r['id'] != new_rule['id']] # إزالة القديم إذا كان تعديلاً
+    db.append(new_rule)
+    save_db(db)
+    return jsonify({"status": "ok"})
 
-@app.route('/api/delete/<word>', methods=['DELETE'])
-def api_delete(word):
-    if word in db["words"]:
-        del db["words"][word]
-        save_data(db)
-    return jsonify({"ok": True})
+@app.route('/api/delete/<id>', methods=['DELETE'])
+def delete_rule(id):
+    global db
+    db = [r for r in db if str(r['id']) != str(id)]
+    save_db(db)
+    return jsonify({"status": "ok"})
 
-def run_server():
+def run_web():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 if __name__ == "__main__":
-    threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=run_web, daemon=True).start()
     bot.run(os.getenv('DISCORD_TOKEN'))
