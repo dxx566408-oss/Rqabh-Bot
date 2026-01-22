@@ -1,9 +1,26 @@
 import discord
 from discord.ext import commands
-from flask import Flask, request, render_template_string
+from flask import Flask, request, jsonify, render_template_string
 import threading
 import os
-import asyncio
+import datetime
+import json
+from interface import HTML_PAGE # استيراد الواجهة من الملف الثاني
+
+# --- إدارة البيانات ---
+DATA_FILE = "database.json"
+
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"words": {}}
+
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+db = load_data()
 
 # --- إعدادات البوت ---
 intents = discord.Intents.default()
@@ -11,121 +28,77 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# قاعدة بيانات وهمية (يُفضل ربطها بـ MongoDB لاحقاً للحفاظ على البيانات)
-data = {
-    "banned_words": {}, # "word": {"action": "ban", "duration": 7, "delete_days": 1, "reply_type": "none"}
-    "logs": []
-}
-
 @bot.event
 async def on_message(message):
     if message.author.bot: return
-    
     content = message.content.lower()
-    for word, config in data["banned_words"].items():
+    for word, config in db["words"].items():
         if word in content:
-            await execute_advanced_action(message, word, config)
-            return
+            await process_violation(message, config)
+            break
     await bot.process_commands(message)
 
-async def execute_advanced_action(message, word, config):
+async def process_violation(message, config):
     user = message.author
-    action = config['action']
-    reason = "مخالفة القوانين (نظام الرقابة التلقائي)"
+    actions = config.get("actions", [])
+    
+    if "delete" in actions:
+        try: await message.delete()
+        except: pass
 
-    try:
-        if action == "delete":
-            await message.delete()
-        
-        elif action == "ban":
-            # delete_messages_days: كم يوم نمسح من رسائله السابقة
-            await user.ban(reason=reason, delete_message_days=int(config.get('delete_days', 0)))
-        
-        elif action == "timeout":
-            import datetime
-            duration = datetime.timedelta(minutes=int(config.get('duration', 10)))
-            await user.timeout(duration, reason=reason)
-            await message.delete()
+    if "reply" in actions:
+        rt = config.get("reply_text", "محتوى مخالف")
+        if config.get("reply_type") == "private":
+            try: await user.send(rt)
+            except: pass
+        else:
+            await message.channel.send(f"⚠️ {user.mention}: {rt}", delete_after=15)
 
-        elif action == "reply":
-            msg_text = config.get('reply_text', 'محتوى مخالف')
-            if config['reply_type'] == "private":
-                await user.send(msg_text)
-            elif config['reply_type'] == "ephemeral":
-                # الرسائل المخفية تعمل فقط مع الـ Slash Commands عادةً، هنا سنرد ونحذف
-                await message.channel.send(f"{user.mention} {msg_text}", delete_after=5)
-            else:
-                await message.reply(msg_text)
-            await message.delete()
+    if "timeout" in actions:
+        try:
+            dur = datetime.timedelta(minutes=int(config.get("duration", 10)))
+            await user.timeout(dur, reason="رقابة آليّة")
+        except: pass
 
-    except Exception as e:
-        print(f"Error: {e}")
+    if "kick" in actions:
+        try: await user.kick(reason="رقابة آليّة")
+        except: pass
 
-# --- إعدادات الموقع (Dashboard) ---
+    if "ban" in actions:
+        try: await user.ban(delete_message_days=1, reason="رقابة آليّة")
+        except: pass
+
+# --- سيرفر الويب ---
 app = Flask(__name__)
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html dir="rtl">
-<head><title>لوحة تحكم البوت الرقابي</title></head>
-<body>
-    <h1>إضافة كلمة محظورة</h1>
-    <form method="POST" action="/add">
-        الكلمة: <input type="text" name="word" required><br>
-        الإجراء: 
-        <select name="action">
-            <option value="delete">Delete</option>
-            <option value="ban">Ban</option>
-            <option value="timeout">Timeout</option>
-            <option value="reply">Reply</option>
-        </select><br>
-        (إذا اخترت Ban/Timeout) المدة بالدقائق: <input type="number" name="duration" value="0"><br>
-        (إذا اخترت Reply) نص الرد أو الرابط: <input type="text" name="reply_text"><br>
-        نوع الرد: 
-        <select name="reply_type">
-            <option value="public">عام</option>
-            <option value="private">خاص</option>
-            <option value="ephemeral">مخفي (تلقائي الحذف)</option>
-        </select><br>
-        <button type="submit">إضافة</button>
-    </form>
-    <hr>
-    <h2>الكلمات الحالية:</h2>
-    <ul>
-        {% for word, cfg in words.items() %}
-            <li>{{ word }} - {{ cfg.action }} <a href="/remove/{{ word }}"> [حذف] </a></li>
-        {% endfor %}
-    </ul>
-</body>
-</html>
-"""
-
 @app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE, words=data["banned_words"])
+def home(): return render_template_string(HTML_PAGE)
 
-@app.route('/add', methods=['POST'])
-def add_word():
-    word = request.form.get('word').lower()
-    data["banned_words"][word] = {
-        "action": request.form.get('action'),
-        "duration": request.form.get('duration'),
-        "reply_text": request.form.get('reply_text'),
-        "reply_type": request.form.get('reply_type')
+@app.route('/api/list')
+def api_list(): return jsonify(db)
+
+@app.route('/api/add', methods=['POST'])
+def api_add():
+    req = request.json
+    db["words"][req['word'].lower()] = {
+        "actions": req['actions'],
+        "reply_text": req.get('reply_text'),
+        "reply_type": req.get('reply_type'),
+        "duration": req.get('duration')
     }
-    return "تمت الإضافة بنجاح! <a href='/'>العودة</a>"
+    save_data(db)
+    return jsonify({"ok": True})
 
-@app.route('/remove/<word>')
-def remove_word(word):
-    if word in data["banned_words"]:
-        del data["banned_words"][word]
-    return "تم الحذف! <a href='/'>العودة</a>"
+@app.route('/api/delete/<word>', methods=['DELETE'])
+def api_delete(word):
+    if word in db["words"]:
+        del db["words"][word]
+        save_data(db)
+    return jsonify({"ok": True})
 
-def run_flask():
+def run_server():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
-# تشغيل الموقع والبوت معاً
 if __name__ == "__main__":
-    t = threading.Thread(target=run_flask)
-    t.start()
+    threading.Thread(target=run_server, daemon=True).start()
     bot.run(os.getenv('DISCORD_TOKEN'))
